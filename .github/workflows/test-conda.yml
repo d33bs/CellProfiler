@@ -1,4 +1,4 @@
-name: test cellprofiler conda environment build
+name: conda tests
 
 on:
   push:
