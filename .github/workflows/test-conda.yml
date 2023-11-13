@@ -6,7 +6,7 @@ on:
       - test-driven-conda-environments
 
 jobs:
-  test-cp-conda-env:
+  test-conda:
 
     strategy:
       matrix:
