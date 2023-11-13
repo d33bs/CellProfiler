@@ -49,6 +49,7 @@ jobs:
     - name: Run Your Tests or Build
       run: |
         # test commands here
+        echo ""
 
     - name: Deactivate Conda Environment
       run: conda deactivate
