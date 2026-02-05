@@ -116,6 +116,10 @@ cluster.
       had grouping enabled in the **Groups** or **LoadData** modules, you 
       can pass in a metadata-defined group, such as ``-g Metadata_Well=A01``
       or ``-g Metadata_Timepoint=0``
+   -  ``--workers <N|auto>``: Use multiple worker processes when running
+      headless. ``auto`` picks a sensible default based on available CPUs.
+      This is only available for full, ungrouped runs (i.e., without ``-f``,
+      ``-l``, or ``-g``).
 
    Typically, a user will break a long image set list into pieces and
    execute each of these pieces using the command line switches, ``-f``

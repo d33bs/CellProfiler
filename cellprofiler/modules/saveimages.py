@@ -788,7 +788,16 @@ to unexpected behavior like saving in the original input file directory. For saf
             if self.file_format.value == FF_H5:
                 save_h5(filename, pixels, volumetric=image.volumetric)
             else:
-                skimage.io.imsave(filename, pixels, **save_kwargs)
+                try:
+                    skimage.io.imsave(filename, pixels, **save_kwargs)
+                except TypeError as exc:
+                    # Some skimage/imageio backends do not accept compression kwargs.
+                    if "compress" in save_kwargs:
+                        save_kwargs = dict(save_kwargs)
+                        save_kwargs.pop("compress", None)
+                        skimage.io.imsave(filename, pixels, **save_kwargs)
+                    else:
+                        raise exc
 
         if self.show_window:
             workspace.display_data.wrote_image = True

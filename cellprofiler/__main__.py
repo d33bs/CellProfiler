@@ -8,6 +8,7 @@ import os.path
 import re
 import sys
 import tempfile
+import threading
 import urllib.parse
 
 import bioformats.formatreader
@@ -15,18 +16,32 @@ import h5py
 import matplotlib
 import numpy
 import pkg_resources
-from cellprofiler_core.constants.measurement import EXPERIMENT
-from cellprofiler_core.constants.measurement import GROUP_INDEX
-from cellprofiler_core.constants.measurement import GROUP_NUMBER
-from cellprofiler_core.constants.measurement import IMAGE
-from cellprofiler_core.constants.pipeline import M_PIPELINE, EXIT_STATUS
+from cellprofiler_core.analysis._analysis import Analysis
+from cellprofiler_core.analysis._runner import Runner
+from cellprofiler_core.analysis.event import Finished, Paused, Progress, Resumed, Started
+from cellprofiler_core.analysis.reply import Ack, Interaction, OmeroLogin, ServerExited
+from cellprofiler_core.analysis.request import (
+    DebugComplete,
+    DebugWaiting,
+    Display,
+    DisplayPostGroup,
+    DisplayPostRun,
+    ExceptionReport,
+)
+from cellprofiler_core.analysis.request import Interaction as InteractionRequest
+from cellprofiler_core.analysis.request import OmeroLogin as OmeroLoginRequest
+from cellprofiler_core.constants.measurement import EXPERIMENT, GROUP_INDEX, GROUP_NUMBER, IMAGE
+from cellprofiler_core.constants.pipeline import EXIT_STATUS, M_PIPELINE
 from cellprofiler_core.measurement import Measurements
 from cellprofiler_core.object import ObjectSet
 from cellprofiler_core.pipeline import LoadException
 from cellprofiler_core.pipeline import Pipeline
 from cellprofiler_core.preferences import get_image_set_file
 from cellprofiler_core.preferences import get_temporary_directory
+from cellprofiler_core.preferences import default_max_workers
 from cellprofiler_core.preferences import set_conserve_memory
+from cellprofiler_core.preferences import get_max_workers
+from cellprofiler_core.preferences import get_plugin_directory
 from cellprofiler_core.preferences import get_omero_port
 from cellprofiler_core.preferences import get_omero_server
 from cellprofiler_core.preferences import get_omero_session_id
@@ -45,6 +60,7 @@ from cellprofiler_core.preferences import set_omero_user
 from cellprofiler_core.preferences import set_plugin_directory
 from cellprofiler_core.preferences import set_temporary_directory
 from cellprofiler_core.preferences import set_widget_inspector
+from cellprofiler_core.utilities.zmq import Reply
 from cellprofiler_core.utilities.core.workspace import is_workspace_file
 from cellprofiler_core.utilities.hdf5_dict import HDF5FileList
 from cellprofiler_core.utilities.java import start_java, stop_java
@@ -53,6 +69,7 @@ from cellprofiler_core.utilities.zmq import join_to_the_boundary
 from cellprofiler_core.worker import aw_parse_args
 from cellprofiler_core.worker import main as worker_main
 from cellprofiler_core.workspace import Workspace
+from cellprofiler_core.image import ImageSetList
 
 if hasattr(sys, "frozen"):
     if sys.platform == "darwin":
@@ -108,6 +125,8 @@ OMERO_CK_SESSION_ID = "session-id"
 OMERO_CK_CONFIG_FILE = "config-file"
 
 numpy.seterr(all="ignore")
+ED_STOP = "Stop"
+ED_CONTINUE = "Continue"
 
 
 def main(args=None):
@@ -418,6 +437,17 @@ def parse_args(args):
         dest="groups",
         default=None,
         help='Restrict processing to one grouping in a grouped pipeline. For instance, "-g ROW=H,COL=01", will process only the group of image sets that match the keys.',
+    )
+
+    parser.add_option(
+        "--workers",
+        dest="workers",
+        default=None,
+        help=(
+            "Number of worker processes to use when running headless. "
+            "Use 'auto' to select a sensible default for this machine. "
+            "Default: auto."
+        ),
     )
 
     parser.add_option(
@@ -882,6 +912,133 @@ def write_schema(pipeline_filename):
     module.prepare_run(workspace)
 
 
+def _parse_worker_count(workers_value):
+    if workers_value is None:
+        return None
+    if isinstance(workers_value, int):
+        return workers_value
+    value = str(workers_value).strip().lower()
+    if value in ("auto", "default", ""):
+        return None
+    if value.isdigit():
+        count = int(value)
+        if count <= 0:
+            raise ValueError("The --workers option must be a positive integer or 'auto'")
+        return count
+    raise ValueError("The --workers option must be a positive integer or 'auto'")
+
+
+def _resolve_worker_count(workers_value, image_set_count):
+    desired = _parse_worker_count(workers_value)
+    if desired is None:
+        desired = get_max_workers()
+        if desired is None:
+            desired = default_max_workers()
+    if image_set_count is not None:
+        desired = min(desired, image_set_count)
+    return max(1, desired)
+
+
+def _finalize_headless_run(options, measurements):
+    if options.done_file is not None:
+        if measurements is not None and measurements.has_feature(
+            EXPERIMENT, EXIT_STATUS,
+        ):
+            done_text = measurements.get_experiment_measurement(EXIT_STATUS)
+            exit_code = 0 if done_text == "Complete" else -1
+        else:
+            done_text = "Failure"
+            exit_code = -1
+
+        with open(options.done_file, "wt") as fd:
+            fd.write("%s\n" % done_text)
+    elif measurements is None or not measurements.has_feature(EXPERIMENT, EXIT_STATUS):
+        exit_code = 1
+    else:
+        exit_code = 0
+
+    if measurements is not None:
+        measurements.close()
+
+    return exit_code
+
+
+def _run_pipeline_headless_multiprocessing(options, pipeline, initial_measurements):
+    if get_plugin_directory() is None:
+        # Worker args require a string path; avoid None in subprocess args.
+        set_plugin_directory("", globally=False)
+
+    measurements = initial_measurements or Measurements()
+    image_set_list = ImageSetList()
+    workspace = Workspace(
+        pipeline, None, None, ObjectSet(), measurements, image_set_list
+    )
+    if not pipeline.prepare_run(workspace):
+        return _finalize_headless_run(options, measurements)
+
+    image_numbers = measurements.get_image_numbers()
+    num_workers = _resolve_worker_count(options.workers, len(image_numbers))
+    if num_workers <= 1:
+        logging.info("Only one worker available; falling back to single-process run.")
+        measurements = pipeline.run(
+            measurements_filename=None,
+            initial_measurements=initial_measurements,
+        )
+        return _finalize_headless_run(options, measurements)
+
+    finished_event = threading.Event()
+    result = {"measurements": None}
+
+    def analysis_event_handler(evt):
+        if isinstance(evt, Started):
+            logging.info("Analysis started with %d worker(s).", num_workers)
+        elif isinstance(evt, Progress):
+            total_jobs = sum(evt.counts.values())
+            completed = sum(
+                count
+                for status, count in evt.counts.items()
+                if status in (Runner.STATUS_DONE, Runner.STATUS_FINISHED_WAITING)
+            )
+            logging.info("Progress: %d/%d image sets complete.", completed, total_jobs)
+        elif isinstance(evt, Finished):
+            result["measurements"] = evt.measurements
+            finished_event.set()
+        elif isinstance(evt, (Display, DisplayPostRun, DisplayPostGroup)):
+            evt.reply(Ack())
+        elif isinstance(evt, InteractionRequest):
+            module_num = evt.module_num
+            args = [evt.__dict__["arg_%d" % idx] for idx in range(evt.num_args)]
+            kwargs = dict(
+                (name, evt.__dict__["kwarg_%s" % name]) for name in evt.kwargs_names
+            )
+            result_value = ""
+            try:
+                module = pipeline.modules(exclude_disabled=False)[module_num - 1]
+                result_value = module.handle_interaction(*args, **kwargs)
+            except Exception as exc:
+                logging.warning("Interaction request failed: %s", exc)
+            finally:
+                evt.reply(Interaction(result=result_value))
+        elif isinstance(evt, OmeroLoginRequest):
+            from bioformats.formatreader import get_omero_credentials
+
+            evt.reply(OmeroLogin(get_omero_credentials()))
+        elif isinstance(evt, ExceptionReport):
+            disposition = ED_CONTINUE if options.always_continue else ED_STOP
+            evt.reply(Reply(disposition=disposition))
+        elif isinstance(evt, (DebugWaiting, DebugComplete)):
+            evt.reply(ServerExited())
+        elif isinstance(evt, (Paused, Resumed)):
+            logging.info("Analysis %s.", "paused" if isinstance(evt, Paused) else "resumed")
+        else:
+            logging.warning("Unhandled analysis event: %s", type(evt))
+
+    analysis = Analysis(pipeline, initial_measurements=measurements)
+    analysis.start(analysis_event_handler, num_workers)
+    finished_event.wait()
+    return _finalize_headless_run(options, result["measurements"])
+
+
 def run_pipeline_headless(options, args):
     """
     Run a CellProfiler pipeline in headless mode
@@ -992,6 +1149,24 @@ def run_pipeline_headless(options, args):
                     options.image_directory
                 )
 
+    workers = _parse_worker_count(options.workers)
+    can_multiprocess = (
+        workers is None or workers > 1
+    ) and options.groups is None and options.first_image_set is None and options.last_image_set is None
+    if initial_measurements is not None:
+        can_multiprocess = False
+
+    if can_multiprocess:
+        return _run_pipeline_headless_multiprocessing(
+            options, pipeline, initial_measurements
+        )
+
+    if workers and workers > 1:
+        logging.info(
+            "Multi-worker execution is not available with the current options; "
+            "falling back to single-process execution."
+        )
+
     measurements = pipeline.run(
         image_set_start=image_set_start,
         image_set_end=image_set_end,
@@ -1000,31 +1175,7 @@ def run_pipeline_headless(options, args):
         initial_measurements=initial_measurements,
     )
 
-    if options.done_file is not None:
-        if measurements is not None and measurements.has_feature(
-            EXPERIMENT, EXIT_STATUS,
-        ):
-            done_text = measurements.get_experiment_measurement(EXIT_STATUS)
-
-            exit_code = 0 if done_text == "Complete" else -1
-        else:
-            done_text = "Failure"
-
-            exit_code = -1
-
-        fd = open(options.done_file, "wt")
-        fd.write("%s\n" % done_text)
-        fd.close()
-    elif not measurements.has_feature(EXPERIMENT, EXIT_STATUS):
-        # The pipeline probably failed
-        exit_code = 1
-    else:
-        exit_code = 0
-
-    if measurements is not None:
-        measurements.close()
-
-    return exit_code
+    return _finalize_headless_run(options, measurements)
 
 
 if __name__ == "__main__":
